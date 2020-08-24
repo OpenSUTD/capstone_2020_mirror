@@ -1,0 +1,381 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: Capstone Mirror Template
+
+Globals:
+  Function:
+    Runtime: python3.8
+    Handler: app.lambda_handler
+    EventInvokeConfig:
+      MaximumRetryAttempts: 0
+    ReservedConcurrentExecutions: 1
+    Environment:
+      Variables:
+        LOG_LEVEL: WARNING
+
+
+Parameters:
+  VolumeId:
+    Type: AWS::EC2::Volume::Id
+    Description: "Existing volume to contain the scraping data"
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: "Keypair name to SSH into scraper instances"
+  CertificateArn:
+    Type: String
+    Description: "ARN of the ACM certificate to encrypt this site"
+  HostedZoneName:
+    Type: String
+    Description: "Name of the hosted zone already present on Route53"
+  MirrorTarget:
+    Type: String
+    Description: "Target domain of the site you want to mirror"
+  MirrorDomain:
+    Type: String
+    Description: "Residing domain of the mirror (i.e. the mirror will be accessible at this domain)"
+
+Resources:
+  StartScraperFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Runtime: python3.8
+      Timeout: 900
+      CodeUri: functions/start_scraper
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - ec2:DescribeInstances
+                - ec2:DescribeVolumes
+                - ec2:DescribeVolumeStatus
+              Resource:
+                - "*"
+            - Effect: Allow
+              Action:
+                - ec2:RunInstances
+                - ec2:TerminateInstances
+                - ec2:AttachVolume
+                - ec2:CreateTags
+              Resource:
+                - "arn:aws:ec2:*:*:subnet/*"
+                - "arn:aws:ec2:*:*:network-interface/*"
+                - "arn:aws:ec2:*:*:instance/*"
+                - "arn:aws:ec2:*:*:volume/*"
+                - "arn:aws:ec2:*::image/ami-*"
+                - "arn:aws:ec2:*:*:key-pair/*"
+                - "arn:aws:ec2:*:*:security-group/*"
+            - Effect: Allow
+              Action:
+                - "iam:PassRole"
+              Resource:
+                - !GetAtt ScraperInstanceIamRole.Arn
+            - Effect: Allow
+              Action:
+                - ssm:DescribeInstanceInformation
+                - ssm:GetCommandInvocation
+                - ssm:SendCommand
+                - ssm:ListCommands
+              Resource:
+                - "*"
+      Environment:
+        Variables:
+          INSTANCE_PROFILE_ARN: !GetAtt ScraperInstanceProfile.Arn
+          INSTANCE_SECURITY_GROUP_ID: !Ref ScraperInstanceSecurityGroup
+          VOLUME_ID: !Ref VolumeId
+          KEYPAIR_NAME: !Ref KeyPairName
+          PLAYBOOKS_BUCKET_NAME: !Ref PlaybooksBucket
+          RUN_ANSIBLE_COMMAND_LOG_GROUP_NAME: !Ref AnsibleProvisionPlaybookLogGroup
+          RUN_HTTRACK_COMMAND_LOG_GROUP_NAME: !Ref RunHttrackShellScriptLogGroup
+          HTTRACK_LOG_GROUP_NAME: !Ref HttrackLogGroup
+          MIRROR_TARGET: !Ref MirrorTarget
+          STACK_NAME: !Ref AWS::StackName
+
+
+  ScraperInstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allows SSH from anywhere
+      SecurityGroupIngress:
+        - CidrIp: 0.0.0.0/0
+          FromPort: 22
+          ToPort: 22
+          IpProtocol: "-1"
+  ScraperInstanceIamRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      Policies:
+        - PolicyName: ModifyDistributionBuckets
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:*
+                Resource:
+                  - !GetAtt MainDistributionBucket.Arn
+                  - !Sub "arn:aws:s3:::${AWS::StackName}-*"
+
+  ScraperInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref ScraperInstanceIamRole
+  CheckCommandStatusFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Timeout: 10
+      CodeUri: functions/check_command_status
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - ssm:ListCommands
+              Resource:
+                - "*"
+  CheckScraperStatusFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Timeout: 10
+      CodeUri: functions/check_scraper_status
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - ssm:SendCommand
+                - ssm:ListCommands
+                - ssm:GetCommandInvocation
+              Resource:
+                - "*"
+  PostProcessFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Timeout: 900
+      CodeUri: functions/post_process
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - ssm:SendCommand
+                - ssm:ListCommands
+              Resource:
+                - "*"
+      Environment:
+        Variables:
+          STACK_NAME: !Ref AWS::StackName
+          PLAYBOOKS_BUCKET_NAME: !Ref PlaybooksBucket
+          RUN_COMMAND_LOG_GROUP_NAME: !Ref AnsiblePostProcessPlaybookLogGroup
+          MAIN_S3_BUCKET_NAME: !Ref MainDistributionBucket
+          VERSIONS_BUCKET_NAME: !Ref VersionsBucket
+          MIRROR_TARGET: !Ref MirrorTarget
+  TerminateInstanceFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: functions/terminate_instance
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - ec2:TerminateInstances
+              Resource:
+                - "*"
+              Condition:
+                StringEquals:
+                  ec2:ResourceTag/Name: "crawler"
+                  ec2:ResourceTag/stack_name: !Ref AWS::StackName
+  UpdateDistributionFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Timeout: 300
+      CodeUri: functions/update_distribution
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - s3:ListBuckets
+              Resource:
+                - "*"
+            - Effect: Allow
+              Action:
+                - s3:*
+              Resource:
+                - !GetAtt VersionsBucket.Arn
+                - !Sub
+                  - "${VersionsBucketArn}/*"
+                  - VersionsBucketArn: !GetAtt VersionsBucket.Arn
+            - Effect: Allow
+              Action:
+                - cloudfront:CreateInvalidation
+              Resource:
+                - !Sub "arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${WebDistribution}"
+      Environment:
+        Variables:
+          STACK_NAME: !Ref AWS::StackName
+          DISTRIBUTION_ID: !Ref WebDistribution
+          VERSIONS_BUCKET_NAME: !Ref VersionsBucket
+
+
+  PlaybooksBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-playbooks"
+
+  AnsibleProvisionPlaybookLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/${AWS::StackName}/ssm_commands/run_ansible/provision"
+      RetentionInDays: 7
+
+  AnsiblePostProcessPlaybookLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/${AWS::StackName}/ssm_commands/run_ansible/post_process"
+      RetentionInDays: 7
+
+  RunHttrackShellScriptLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/${AWS::StackName}/ssm_commands/run_shell/httrack"
+      RetentionInDays: 7
+
+  HttrackLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/${AWS::StackName}/httrack"
+      RetentionInDays: 7
+
+  MainDistributionBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-distribution"
+
+  VersionsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-versions"
+
+  MainDistributionBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref MainDistributionBucket
+      PolicyDocument:
+        Statement:
+          - Action:
+              - "s3:GetObject"
+            Effect: "Allow"
+            Resource: !Sub "arn:aws:s3:::${MainDistributionBucket}/*"
+            Principal:
+              AWS: !Sub "arn:aws:iam::cloudfront:user/CloudFront Origin Access Identity ${OriginAccessIdentity}"
+
+  OriginAccessIdentity:
+    Type: AWS::CloudFront::CloudFrontOriginAccessIdentity
+    Properties:
+      CloudFrontOriginAccessIdentityConfig:
+        Comment: The identity cloudfront will use to access the main distribution bucket
+
+  WebDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Origins:
+          - DomainName: !Sub "${MainDistributionBucket}.s3-ap-southeast-1.amazonaws.com"
+            Id: myS3Origin
+            S3OriginConfig:
+              OriginAccessIdentity: !Sub "origin-access-identity/cloudfront/${OriginAccessIdentity}"
+        Enabled: true
+        Comment: "The main distribution"
+        DefaultRootObject: "index.html"
+        Aliases:
+          - !Ref MirrorDomain
+          - !Sub "www.${MirrorDomain}"
+        IPV6Enabled: false
+        HttpVersion: http2
+        DefaultCacheBehavior:
+          AllowedMethods:
+            - DELETE
+            - GET
+            - HEAD
+            - OPTIONS
+            - PATCH
+            - POST
+            - PUT
+          TargetOriginId: myS3Origin
+          ForwardedValues:
+            QueryString: false
+            Cookies:
+              Forward: none
+          ViewerProtocolPolicy: redirect-to-https
+        PriceClass: PriceClass_200
+        ViewerCertificate:
+          AcmCertificateArn: !Ref CertificateArn
+          MinimumProtocolVersion: TLSv1.2_2018
+          SslSupportMethod: sni-only
+
+  DomainNames:
+    Type: AWS::Route53::RecordSetGroup
+    Properties:
+      HostedZoneName: !Ref HostedZoneName
+      RecordSets:
+        - Name: !Ref MirrorDomain
+          Type: A
+          AliasTarget:
+            HostedZoneId: Z2FDTNDATAQYW2 # this is AWS's cloudfront.net hosted zone id
+            DNSName: !GetAtt WebDistribution.DomainName
+        - Name: !Sub "www.${MirrorDomain}"
+          Type: CNAME
+          TTL: 300
+          ResourceRecords:
+            - !GetAtt WebDistribution.DomainName
+
+  MirroringStateMachine:
+    Type: AWS::Serverless::StateMachine # More info about State Machine Resource: https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/sam-resource-statemachine.html
+    Properties:
+      DefinitionUri: statemachine/mirror.asl.json
+      DefinitionSubstitutions:
+        StartScraperFunctionArn: !GetAtt StartScraperFunction.Arn
+        CheckCommandStatusFunctionArn: !GetAtt CheckCommandStatusFunction.Arn
+        CheckScraperStatusFunctionArn: !GetAtt CheckScraperStatusFunction.Arn
+        PostProcessFunctionArn: !GetAtt PostProcessFunction.Arn
+        TerminateInstanceFunctionArn: !GetAtt TerminateInstanceFunction.Arn
+        UpdateDistributionFunctionArn: !GetAtt UpdateDistributionFunction.Arn
+      Policies: # Find out more about SAM policy templates: https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/serverless-policy-templates.html
+        - LambdaInvokePolicy:
+            FunctionName: !Ref StartScraperFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref CheckCommandStatusFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref CheckScraperStatusFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref PostProcessFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref TerminateInstanceFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref UpdateDistributionFunction
+Outputs:
+  PlaybooksBucketName:
+    Description: Sync the contents of the playbooks folder to this bucket
+    Value: !Ref PlaybooksBucket
+  DistributionDomainName:
+    Description: DNS Name of the Distribution
+    Value: !GetAtt WebDistribution.DomainName
+  MirrorBuildStepFunctionName:
+    Description: Name of the Step Function to trigger mirror builds
+    Value: !GetAtt MirroringStateMachine.Name

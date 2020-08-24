@@ -1,0 +1,25 @@
+---
+
+- name: Copy out requirements files
+  copy:
+    src: ../files/requirements.txt
+    dest: /tmp/requirements.txt
+
+- name: Install dependencies
+  pip:
+    requirements: /tmp/requirements.txt
+    executable: /usr/bin/pip3
+    extra_args: --user
+  become_user: ec2-user
+
+- name: Copy out python program
+  copy:
+    src: ../files/process.py
+    dest: /tmp/process.py
+
+- name: Run python program
+  script: /tmp/process.py
+  args:
+    chdir: /home/ec2-user/mirror/{{mirror_target}}
+    executable: /usr/bin/python3
+  become_user: ec2-user

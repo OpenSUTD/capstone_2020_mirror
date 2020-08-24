@@ -1,0 +1,9 @@
+---
+
+- name: Copy index to working directory
+  copy:
+    src: /var/mirror
+    dest: /home/ec2-user/
+    remote_src: yes
+    owner: ec2-user
+    group: ec2-user

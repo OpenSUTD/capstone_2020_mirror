@@ -1,0 +1,146 @@
+{
+    "Comment": "Mirror builder workflow",
+    "StartAt": "start_scraper",
+    "States": {
+        "start_scraper": {
+            "Type": "Task",
+            "Resource": "${StartScraperFunctionArn}",
+            "Next": "was_scraping_skipped?",
+            "ResultPath": "$.scraper_information"
+        },
+        "was_scraping_skipped?": {
+            "Type": "Choice",
+            "Choices": [
+                {
+                    "Variable": "$.skip_scraping",
+                    "BooleanEquals": false,
+                    "Next": "wait_on_scraper"
+                },
+                {
+                    "Variable": "$.skip_scraping",
+                    "BooleanEquals": true,
+                    "Next": "post_process"
+                }
+            ],
+            "Default": "wait_on_scraper"
+        },
+        "wait_on_scraper": {
+            "Type": "Wait",
+            "Seconds": 300,
+            "Next": "check_scraper_status"
+        },
+        "check_scraper_status": {
+            "Type": "Task",
+            "Resource": "${CheckScraperStatusFunctionArn}",
+            "Next": "is_scraper_done?",
+            "InputPath": "$.scraper_information",
+            "ResultPath": "$.scraper_information.status",
+            "Catch": [{
+                "ErrorEquals": ["States.ALL"],
+                "Next": "terminate_instance"
+            }]
+        },
+        "is_scraper_done?": {
+            "Type": "Choice",
+            "Choices": [
+                {
+                    "Variable": "$.scraper_information.status",
+                    "StringEquals": "running",
+                    "Next": "wait_on_scraper"
+                }
+            ],
+            "Default": "post_process"
+        },
+        "post_process": {
+            "Type": "Task",
+            "Resource": "${PostProcessFunctionArn}",
+            "Parameters": {
+                "instance_id.$": "$.scraper_information.instance_id"
+            },
+            "ResultPath": "$.post_process_information",
+            "Next": "check_post_process_status",
+            "Catch": [{
+                "ErrorEquals": ["States.ALL"],
+                "Next": "terminate_instance"
+            }]
+        },
+        "check_post_process_status": {
+            "Type": "Task",
+            "Resource": "${CheckCommandStatusFunctionArn}",
+            "Parameters": {
+                "command_id.$": "$.post_process_information.command_id"
+            },
+            "ResultPath": "$.post_process_information.status",
+            "Next": "is_processing_done?",
+            "Catch": [{
+                "ErrorEquals": ["States.ALL"],
+                "Next": "terminate_instance"
+            }]
+        },
+        "is_processing_done?": {
+            "Type": "Choice",
+            "Choices": [
+                {
+                    "Variable": "$.post_process_information.status",
+                    "StringEquals": "Success",
+                    "Next": "publish_and_terminate"
+                },
+                {
+                    "Variable": "$.post_process_information.status",
+                    "StringEquals": "InProgress",
+                    "Next": "wait_on_post_process"
+                },
+                {
+                    "Variable": "$.post_process_information.status",
+                    "StringEquals": "Delayed",
+                    "Next": "wait_on_post_process"
+                },
+                {
+                    "Variable": "$.post_process_information.status",
+                    "StringEquals": "Pending",
+                    "Next": "wait_on_post_process"
+                }
+            ],
+            "Default": "terminate_instance"
+        },
+        "wait_on_post_process": {
+            "Type": "Wait",
+            "Seconds": 60,
+            "Next": "check_post_process_status"
+        },
+        "publish_and_terminate": {
+            "Type": "Parallel",
+            "End": true,
+            "Branches": [
+                {
+                    "StartAt": "update_distribution",
+                    "States": {
+                        "update_distribution": {
+                            "Type": "Task",
+                            "End": true,
+                            "Resource": "${UpdateDistributionFunctionArn}",
+                            "InputPath": "$.post_process_information"
+                        }
+                    }
+                },
+                {
+                    "StartAt": "_terminate_instance",
+                    "States": {
+                        "_terminate_instance": {
+                            "Type": "Task",
+                            "End": true,
+                            "Resource": "${TerminateInstanceFunctionArn}",
+                            "InputPath": "$.scraper_information"
+                        }
+                    }
+                }
+            ]
+        },
+        "terminate_instance": {
+            "Type": "Task",
+            "Resource": "${TerminateInstanceFunctionArn}",
+            "InputPath": "$.scraper_information",
+            "End": true
+        }
+    }
+}

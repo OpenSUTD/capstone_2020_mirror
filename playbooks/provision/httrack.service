@@ -1,0 +1,10 @@
+[Unit]
+Description="HTTrack Service"
+ConditionPathExists=!/var/mirror/hts-in_progress.lock
+
+[Service]
+Type=simple
+User=ec2-user
+Group=ec2-user
+ExecStart=/bin/bash /home/ec2-user/run_httrack.sh
+KillSignal=SIGINT

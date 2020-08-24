@@ -1,0 +1,31 @@
+---
+
+- name: Ensure boto and boto3 modules are installed
+  pip:
+    name: "{{ item }}"
+  with_items:
+    - boto3
+    - botocore
+
+- name: Create version archive
+  archive:
+    path: "/home/ec2-user/mirror/{{mirror_target}}"
+    dest: "/tmp/mirror.tgz"
+
+- name: Upload to version bucket
+  aws_s3:
+    bucket: "{{version_s3_bucket}}"
+    object: "{{datestring}}.tgz"
+    region: ap-southeast-1
+    src: "/tmp/mirror.tgz"
+    mode: put
+
+- name: Upload to main distribution bucket
+  s3_sync:
+    bucket: "{{main_s3_bucket}}"
+    region: ap-southeast-1
+    file_root: "/home/ec2-user/mirror/{{mirror_target}}"
+    mime_map:
+      .html: text/html
+    file_change_strategy: checksum
+    delete: yes

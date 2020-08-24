@@ -1,0 +1,61 @@
+---
+- hosts: all
+  become: true
+  tasks:
+    - name: change timezone to Singapore
+      timezone:
+        name: Asia/Singapore
+
+    - name: Download and install Cloudwatch Agent
+      yum:
+        name: https://s3.ap-southeast-1.amazonaws.com/amazoncloudwatch-agent-ap-southeast-1/amazon_linux/amd64/latest/amazon-cloudwatch-agent.rpm
+
+    - name: Gather EC2 facts
+      action: ec2_metadata_facts
+
+    - name: Install EPEL
+      yum:
+        name: https://dl.fedoraproject.org/pub/epel/epel-release-latest-7.noarch.rpm
+        state: present
+
+    - name: Install httrack
+      yum:
+        name: httrack
+        state: installed
+        enablerepo: epel
+
+    - name: Install httrack service file
+      copy:
+        src: httrack.service
+        dest: /usr/lib/systemd/system/httrack.service
+
+    - name: Copy httrack launcher script
+      template:
+        src: run_httrack.sh
+        dest: /home/ec2-user/run_httrack.sh
+
+    - name: Install python3
+      yum:
+        name: python3
+        state: installed
+
+    - name: Mount mirror volume
+      mount:
+        path: /var/mirror
+        src: /dev/sdg
+        fstype: xfs
+        state: mounted
+
+    - name: Copy cwagent configuration file
+      template:
+        src: cwconfig.json
+        dest: /opt/aws/amazon-cloudwatch-agent/bin/config.json
+
+    - name: Start the cwagent
+      shell: /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -s -c file:/opt/aws/amazon-cloudwatch-agent/bin/config.json
+
+    - name: Start httrack
+      systemd:
+        name: httrack
+        state: started
+      when: not skip_scraping|bool
